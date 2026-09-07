@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Conexion "pooled" (pgbouncer) para las consultas normales de la app --
+  // necesaria en hosting serverless/con muchas conexiones cortas, pero no
+  // soporta los prepared statements que usan las migraciones.
+  url       = env("DATABASE_URL")
+  // Conexion directa (sin pooler) usada solo por `prisma migrate` / `db push`.
+  directUrl = env("DIRECT_URL")
+}
+
+enum PackageStatus {
+  PENDING // registrado en el sistema, aun no recolectado
+  PICKED_UP
+  IN_TRANSIT
+  CUSTOMS
+  OUT_FOR_DELIVERY
+  DELIVERED
+  EXCEPTION // retraso, direccion incorrecta, intento fallido, etc.
+}
+
+enum ConversationRole {
+  USER
+  ASSISTANT
+}
+
+enum ConversationSessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum EscalationStatus {
+  OPEN
+  RESOLVED
+}
+
+enum SurveyStatus {
+  PENDING
+  RESPONDED
+  EXPIRED
+}
+
+// Un paquete tal como lo devolveria la plataforma de tracking global del
+// courier. Por ahora esta tabla ES la "plataforma" (ver src/lib/trackingProvider.ts,
+// que la envuelve detras de una interfaz para poder reemplazarla despues por
+// el API real sin tocar el bot).
+model Package {
+  id                String              @id @default(cuid())
+  trackingNumber    String              @unique
+  description       String?
+  originCity        String?
+  destinationCity   String?
+  carrier           String?
+  weightKg          Float?
+  status            PackageStatus       @default(PENDING)
+  estimatedDelivery DateTime?
+  recipientName     String?
+  recipientPhone    String? // numero de WhatsApp del destinatario, formato whatsapp:+506... -- usado para la encuesta de satisfaccion tras la entrega
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  events            TrackingEvent[]
+  survey            SatisfactionSurvey?
+
+  @@index([status])
+}
+
+// Historial cronologico de un paquete -- es lo que hace visible el
+// "recorrido" cuando se consulta el tracking.
+model TrackingEvent {
+  id         String        @id @default(cuid())
+  package    Package       @relation(fields: [packageId], references: [id])
+  packageId  String
+  status     PackageStatus
+  location   String?
+  note       String?
+  occurredAt DateTime      @default(now())
+
+  @@index([packageId, occurredAt])
+}
+
+// Catalogo de tarifas de envio que el bot usa para responder preguntas de precio.
+model ShippingRate {
+  id          String  @id @default(cuid())
+  name        String
+  description String?
+  priceCents  Int
+  currency    String  @default("CRC")
+  active      Boolean @default(true)
+}
+
+// Base de conocimiento editable desde el panel (horarios, cobertura, como
+// enviar un paquete, politica de reclamos, etc.) -- el bot la consulta en vez
+// de tener esta informacion hardcodeada en el system prompt.
+model FaqEntry {
+  id        String   @id @default(cuid())
+  topic     String
+  answer    String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+// Encuesta de satisfaccion (NPS) enviada tras marcar un paquete como entregado.
+model SatisfactionSurvey {
+  id          String       @id @default(cuid())
+  package     Package      @relation(fields: [packageId], references: [id])
+  packageId   String       @unique
+  phone       String
+  status      SurveyStatus @default(PENDING)
+  sentAt      DateTime     @default(now())
+  respondedAt DateTime?
+  score       Int? // 1-10
+  comment     String?
+
+  @@index([phone, status])
+}
+
+// Una sesion de conversacion agrupa los mensajes de una "charla" continua
+// con un numero de WhatsApp. Se cierra automaticamente tras un periodo de
+// inactividad (ver el job de cierre) -- al escribir de nuevo despues de
+// cerrada, se abre una sesion nueva sin memoria de la anterior, para que el
+// bot siempre saluda de cero.
+model ConversationSession {
+  id            String                    @id @default(cuid())
+  phone         String
+  status        ConversationSessionStatus @default(OPEN)
+  startedAt     DateTime                  @default(now())
+  lastMessageAt DateTime                  @default(now())
+  warnedAt      DateTime? // se avisa una sola vez antes de cerrar por inactividad
+  closedAt      DateTime?
+  messages      ConversationMessage[]
+
+  @@index([phone, status])
+}
+
+model ConversationMessage {
+  id        String              @id @default(cuid())
+  session   ConversationSession @relation(fields: [sessionId], references: [id])
+  sessionId String
+  phone     String
+  role      ConversationRole
+  content   String
+  createdAt DateTime            @default(now())
+
+  @@index([sessionId, createdAt])
+}
+
+model Escalation {
+  id         String           @id @default(cuid())
+  phone      String
+  reason     String
+  status     EscalationStatus @default(OPEN)
+  createdAt  DateTime         @default(now())
+  resolvedAt DateTime?
+
+  @@index([phone])
+}
