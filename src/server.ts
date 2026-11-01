@@ -10,6 +10,7 @@ import { whatsappRouter } from "./routes/whatsapp";
 import { adminRouter } from "./routes/admin";
 import { panelRouter } from "./routes/panel";
 import { webchatRouter } from "./routes/webchat";
+import { db as dbClient } from "./lib/db";
 import { startInactivitySweeper } from "./services/conversationScheduler";
 import { startPackageProgressionScheduler } from "./services/packageProgressionScheduler";
 
@@ -31,9 +32,23 @@ app.use(express.urlencoded({ extended: false })); // Twilio y los formularios de
 app.use(express.json());
 app.use(cookieParser(process.env.ADMIN_API_KEY)); // misma clave se usa para firmar la cookie del panel
 
-app.get("/health", (_req, res) => {
+// Siempre responde 200 (para no tumbar el health check del hosting si la base
+// de datos esta caida), pero toca la base de datos: un ping externo periodico
+// a esta ruta mantiene despierto el servicio gratis de Render Y evita que
+// Supabase (plan gratis) pause el proyecto por inactividad.
+app.get("/health", async (_req, res) => {
+  let db: "ok" | "error" = "ok";
+  try {
+    await Promise.race([
+      dbClient.$queryRaw`SELECT 1`,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000)),
+    ]);
+  } catch {
+    db = "error";
+  }
   res.json({
     status: "ok",
+    db,
     serverTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     serverLocalTime: new Date().toString(),
   });
