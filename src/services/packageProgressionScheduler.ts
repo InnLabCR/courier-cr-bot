@@ -39,6 +39,13 @@ function pickLocation(status: PackageStatus, destinationCity: string | null): st
  * "Avanzar") para una demo en vivo sin depender de este barrido.
  */
 export async function sweepOnce(): Promise<void> {
+  // PACKAGE_SIMULATION=off congela los estados (util para una demo donde el
+  // staff avanza los paquetes a mano desde el panel); las encuestas siguen.
+  if (process.env.PACKAGE_SIMULATION === "off") {
+    await sendPendingSatisfactionSurveys();
+    return;
+  }
+
   const cutoff = new Date(Date.now() - MIN_AGE_BEFORE_ADVANCE_MS);
   const eligibleStatuses = Object.keys(NEXT_STATUS) as PackageStatus[];
 
