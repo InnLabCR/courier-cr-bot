@@ -65,3 +65,32 @@ export async function notifyEscalation(phone: string, reason: string): Promise<v
   )}\nMotivo: ${reason}`;
   await notifyStaff("Escalamiento a humano", text);
 }
+
+/**
+ * Marca como resuelta la escalacion abierta mas reciente de este numero --
+ * usado cuando el propio bot termina resolviendo, mas adelante en la MISMA
+ * conversacion, lo que habia motivado la escalacion (ej. escalo porque el
+ * cliente no tenia el numero de guia, y luego el cliente lo encontro y el bot
+ * ya le dio el estado). Avisa al staff de que ya no hace falta que contacten
+ * a ese cliente, para no duplicar esfuerzo.
+ */
+export async function resolveLatestEscalation(phone: string, note?: string): Promise<boolean> {
+  const escalation = await db.escalation.findFirst({
+    where: { phone, status: "OPEN" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!escalation) return false;
+
+  await db.escalation.update({
+    where: { id: escalation.id },
+    data: { status: "RESOLVED", resolvedAt: new Date() },
+  });
+
+  const text = `Una escalacion ya no requiere seguimiento -- el bot termino de resolverla el mismo, mas adelante en la conversacion.\nWhatsApp: ${phone.replace(
+    "whatsapp:",
+    "",
+  )}\nMotivo original: ${escalation.reason}${note ? `\nComo se resolvio: ${note}` : ""}`;
+  await notifyStaff("Escalamiento ya resuelto (no requiere contacto)", text);
+
+  return true;
+}

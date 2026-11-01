@@ -3,7 +3,7 @@ import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import { getTrackingProvider, PackageSnapshot } from "./trackingProvider";
 import { listActiveShippingRates, listActiveFaqEntries, STATUS_LABELS } from "../services/packages";
-import { notifyEscalation } from "../services/notifications";
+import { notifyEscalation, resolveLatestEscalation } from "../services/notifications";
 import { closeSession } from "../services/conversation";
 
 const client = new Anthropic();
@@ -23,7 +23,12 @@ Reglas generales de conversacion:
 - NUNCA prometas fechas de entrega exactas que no vengan de track_package, ni des explicaciones tecnicas/legales de aduanas que no manejes con certeza -- en eso escala a un humano con escalate_to_human.
 - Cuando algo falle (ej. numero de guia no encontrado) o el cliente pregunte "por que" o no este de acuerdo con algo, no te quedes en una respuesta plana ni repitas el mismo mensaje: explica la razon real con tus propias palabras, de forma natural y conversacional, y proactivamente ofrece la siguiente accion util (revisar el numero, reintentar, escalar). Usa escalate_to_human solo cuando genuinamente no tengas forma de resolverlo con tus herramientas -- no lo uses como salida facil solo porque el cliente insistio o hizo una pregunta de seguimiento que si puedes responder razonando.
 - Escala a un humano con escalate_to_human cuando: el paquete parece perdido o con una incidencia sin resolver por mucho tiempo, el cliente reporta un paquete danado, quiere poner un reclamo formal, esta genuinamente molesto sin que puedas resolverlo, esta confundido de forma persistente, pide explicitamente hablar con una persona, o pide un tramite/gestion que claramente no manejas por WhatsApp (ej. abrir o gestionar un casillero, cambios de cuenta, facturacion, y similares -- cualquier cosa fuera de rastreo/tarifas/info general que requiera que una persona lo atienda).
-- IMPORTANTE: cuando la solicitud sea claramente algo que no puedes resolver tu (un tramite que solo hace un humano, algo fuera de tu alcance), NO le preguntes al cliente si quiere que lo transfieras -- eso agrega un paso de ida y vuelta innecesario. Dile en la misma respuesta que no puedes ayudarlo con eso y que ya lo estas conectando con un asesor humano, Y llama a escalate_to_human de una vez en ese mismo turno (no esperes a que confirme). Ejemplo: "Eso no lo puedo gestionar yo por aqui, pero ya te conecto con un asesor humano para que te ayude con el casillero." La pregunta "¿quieres que te transfiera?" solo tiene sentido en casos ambiguos donde no esta claro si el cliente realmente quiere escalar (ej. esta frustrado pero tal vez tu si puedas resolverlo) -- para pedidos claramente fuera de tu alcance, actua directo.
+- IMPORTANTE: cuando la solicitud sea claramente algo que no puedes resolver tu (un tramite que solo hace un humano, algo fuera de tu alcance), NO le preguntes al cliente si quiere que lo transfieras -- eso agrega un paso de ida y vuelta innecesario. Tu respuesta en ese turno DEBE tener, en este orden, las tres partes siguientes (nunca te saltes la parte 2 -- no basta con confirmar la transferencia, tienes que decir primero y explicitamente que tu no lo puedes hacer):
+  1. Reconoce puntualmente lo que te pidio, nombrandolo (no generico).
+  2. Dile EXPLICITAMENTE, con esas o parecidas palabras, que "eso no lo puedo hacer/gestionar yo" -- esta frase de que TU no puedes es obligatoria, no la omitas ni la des por sobreentendida.
+  3. Dile que ya lo estas conectando con un asesor humano que si puede ayudarlo con eso.
+  Y llama a escalate_to_human de una vez en ese mismo turno (no esperes a que confirme). Ejemplo (el cliente pidio abrir un casillero): "¡Hola! La apertura de casilleros es un tramite que yo no puedo gestionar por aqui, pero ya te conecto con un asesor humano de nuestro equipo para que te ayude con eso." Una respuesta que solo dice "listo, ya te contactara alguien" SIN antes decir que tu no puedes hacerlo esta INCOMPLETA -- corrigela. La pregunta "¿quieres que te transfiera?" solo tiene sentido en casos ambiguos donde no esta claro si el cliente realmente quiere escalar (ej. esta frustrado pero tal vez tu si puedas resolverlo) -- para pedidos claramente fuera de tu alcance, actua directo mencionando siempre que tu no puedes hacerlo.
+- Si escalaste antes en esta misma conversacion y despues, sin necesitar a un humano, terminas resolviendo exactamente lo que la habia motivado (ej. escalaste porque el cliente no tenia el numero de guia, y unos mensajes despues lo encontro y ya le diste el estado de su paquete), llama a resolve_own_escalation -- asi el staff no pierde tiempo contactando a alguien que ya quedo atendido.
 - Cuando la conversacion llegue a su fin natural -- el cliente dice "gracias", "no gracias", "eso es todo", se despide, o ya resolviste lo que necesitaba y confirma que no necesita nada mas -- responde la despedida normalmente Y ADEMAS llama a end_conversation. Esto es importante: si no la llamas, un "Hola" que el cliente escriba poco despues puede retomar el tema ya cerrado en vez de saludar de cero, que es justo lo que no queremos.
 
 Flujo para RASTREAR un paquete:
@@ -132,7 +137,21 @@ function buildScopedTools(phone: string, sessionId: string) {
       }),
       run: async ({ reason }) => {
         await notifyEscalation(phone, reason);
-        return "Se avisara a un miembro del equipo para que te contacte lo antes posible.";
+        return "Escalamiento registrado -- un miembro del equipo contactara al cliente.";
+      },
+    }),
+    betaZodTool({
+      name: "resolve_own_escalation",
+      description:
+        "Marca como resuelta la escalacion mas reciente que TU MISMO hiciste antes en esta misma conversacion, porque acabas de terminar de resolver, sin necesitar a un humano, exactamente lo que la habia motivado (ej. escalaste porque el cliente no tenia el numero de guia, y unos mensajes despues lo encontro y ya le diste el estado de su paquete). Esto evita que el staff contacte al cliente innecesariamente. NO la uses si la escalacion sigue siendo necesaria o trata de otra cosa distinta a lo que acabas de resolver.",
+      inputSchema: z.object({
+        note: z.string().optional().describe("Breve nota de como se resolvio, para el registro del staff"),
+      }),
+      run: async ({ note }) => {
+        const resolved = await resolveLatestEscalation(phone, note);
+        return resolved
+          ? "Escalacion anterior marcada como resuelta -- el staff ya no necesita contactar al cliente por eso."
+          : "No habia ninguna escalacion abierta para este cliente.";
       },
     }),
     betaZodTool({
@@ -163,21 +182,42 @@ export async function processIncomingMessage(
   history: ChatTurn[],
   userMessage: string,
 ): Promise<ProcessResult> {
+  const inputMessages = [
+    ...history.map((h) => ({ role: h.role, content: h.content })),
+    { role: "user" as const, content: userMessage },
+  ];
+
   const runner = client.beta.messages.toolRunner({
     model: MODEL,
     max_tokens: 1024,
     system: buildSystemPrompt(),
     output_config: { effort: EFFORT },
     tools: buildScopedTools(phone, sessionId),
-    messages: [...history.map((h) => ({ role: h.role, content: h.content })), { role: "user", content: userMessage }],
+    messages: inputMessages,
   });
 
-  const finalMessage = await runner;
+  await runner;
 
-  const textBlocks = finalMessage.content.filter(
-    (b): b is Extract<(typeof finalMessage.content)[number], { type: "text" }> => b.type === "text",
-  );
-  const reply = textBlocks.map((b) => b.text).join("\n").trim();
+  // El runner puede generar varios turnos del asistente en un mismo
+  // intercambio (ej. uno que explica algo Y llama una herramienta, seguido
+  // de otro turno corto una vez que ve el resultado de la herramienta) --
+  // leer solo el ultimo turno (como se hacia antes) pierde el texto de los
+  // turnos intermedios. Se junta el texto de TODOS los turnos del asistente
+  // generados en este intercambio (no los del historial previo, por eso se
+  // hace slice desde donde terminaban los mensajes de entrada).
+  const newMessages = runner.params.messages.slice(inputMessages.length);
+  const replyParts: string[] = [];
+  for (const msg of newMessages) {
+    if (msg.role !== "assistant") continue;
+    if (typeof msg.content === "string") {
+      replyParts.push(msg.content);
+      continue;
+    }
+    for (const block of msg.content) {
+      if (block.type === "text") replyParts.push(block.text);
+    }
+  }
+  const reply = replyParts.join("\n\n").trim();
 
   return { reply: reply || "Disculpa, no pude procesar tu mensaje. Un miembro del equipo te contactara pronto." };
 }
